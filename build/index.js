@@ -4,33 +4,95 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError, } from '@modelcontextprotocol/sdk/types.js';
 import axios from 'axios';
 import { config } from 'dotenv';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 // Load environment variables
 config();
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const TOKEN_FILE = join(__dirname, '..', '.tokens.json');
 const YAHOO_CLIENT_ID = process.env.YAHOO_CLIENT_ID || '';
 const YAHOO_CLIENT_SECRET = process.env.YAHOO_CLIENT_SECRET || '';
-const YAHOO_REFRESH_TOKEN = process.env.YAHOO_REFRESH_TOKEN || '';
+// Load tokens: saved file takes precedence over env vars
+let refreshToken = process.env.YAHOO_REFRESH_TOKEN || '';
 let accessToken = process.env.YAHOO_ACCESS_TOKEN || '';
-if (!YAHOO_CLIENT_ID || !YAHOO_CLIENT_SECRET || !YAHOO_REFRESH_TOKEN) {
+if (existsSync(TOKEN_FILE)) {
+    try {
+        const saved = JSON.parse(readFileSync(TOKEN_FILE, 'utf-8'));
+        if (saved.refresh_token)
+            refreshToken = saved.refresh_token;
+        if (saved.access_token)
+            accessToken = saved.access_token;
+        console.error(`Loaded tokens from ${TOKEN_FILE}`);
+    }
+    catch {
+        console.error(`Warning: could not parse ${TOKEN_FILE}, using env vars`);
+    }
+}
+if (!YAHOO_CLIENT_ID || !YAHOO_CLIENT_SECRET || !refreshToken) {
     throw new Error('YAHOO_CLIENT_ID, YAHOO_CLIENT_SECRET, and YAHOO_REFRESH_TOKEN are required');
 }
 const LEAGUE_ID = '199298';
 const GAME_KEY = '469';
 const TEAM_ID = '6';
 const LEAGUE_KEY = `${GAME_KEY}.l.${LEAGUE_ID}`;
+function saveTokens() {
+    try {
+        writeFileSync(TOKEN_FILE, JSON.stringify({
+            access_token: accessToken,
+            refresh_token: refreshToken,
+            updated_at: new Date().toISOString(),
+        }, null, 2));
+        console.error(`Tokens saved to ${TOKEN_FILE}`);
+    }
+    catch (err) {
+        console.error('Warning: could not save tokens:', err);
+    }
+}
 async function refreshAccessToken() {
     const basicAuth = Buffer.from(`${YAHOO_CLIENT_ID}:${YAHOO_CLIENT_SECRET}`).toString('base64');
-    const response = await axios.post('https://api.login.yahoo.com/oauth2/get_token', new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: YAHOO_REFRESH_TOKEN,
-    }).toString(), {
-        headers: {
-            'Authorization': `Basic ${basicAuth}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-        },
-    });
-    accessToken = response.data.access_token;
-    console.error('Access token refreshed successfully');
-    return accessToken;
+    try {
+        const response = await axios.post('https://api.login.yahoo.com/oauth2/get_token', new URLSearchParams({
+            grant_type: 'refresh_token',
+            refresh_token: refreshToken,
+        }).toString(), {
+            headers: {
+                'Authorization': `Basic ${basicAuth}`,
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+        });
+        accessToken = response.data.access_token;
+        // Yahoo may rotate the refresh token — save it if they do
+        if (response.data.refresh_token) {
+            refreshToken = response.data.refresh_token;
+            console.error('Refresh token rotated by Yahoo');
+        }
+        saveTokens();
+        console.error('Access token refreshed successfully');
+        return accessToken;
+    }
+    catch (error) {
+        if (axios.isAxiosError(error)) {
+            const data = error.response?.data;
+            const desc = data?.error_description || data?.error || 'unknown';
+            if (data?.error === 'invalid_grant' || error.response?.status === 401) {
+                console.error('\n========================================');
+                console.error('REFRESH TOKEN EXPIRED OR REVOKED');
+                console.error('========================================');
+                console.error(`Error: ${desc}`);
+                console.error('\nTo re-authenticate:');
+                console.error('  1. cd to the MCP server directory');
+                console.error('  2. openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\');
+                console.error('       -keyout /tmp/yahoo_oauth_key.pem -out /tmp/yahoo_oauth_cert.pem \\');
+                console.error('       -subj "/CN=localhost"');
+                console.error('  3. sudo node build/get-oauth2-token.js');
+                console.error('  4. Open the URL in your browser and authorize');
+                console.error('  5. Copy the new tokens into .mcp.json env vars');
+                console.error('  6. Reconnect with /mcp\n');
+            }
+        }
+        throw error;
+    }
 }
 class YahooFantasyBaseballServer {
     server;
